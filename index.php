@@ -324,6 +324,33 @@ handle_tf_route();
 session_start();
 cleanup_expired();
 cleanup_expired_agents();
+function maybe_auto_backup() {
+global $base_dir, $conf_file;
+$cfg = load_config();
+if (empty($cfg['backup_auto_enabled'])) return;
+$interval_days = max(1, (int)($cfg['backup_auto_interval'] ?? 7));
+$last = (int)($cfg['backup_auto_last'] ?? 0);
+if ($last > 0 && (time() - $last) < $interval_days * 86400) return;
+$bk = [
+'backup_type' => 'pablo_panel_full',
+'version'     => 1,
+'created_at'  => time(),
+'created_by'  => 'auto-cron',
+'data'        => load_files(),
+'users'       => load_users(),
+'config'      => $cfg,
+];
+@mkdir($base_dir . '/backups', 0755, true);
+$fp = $base_dir . '/backups/pablo-backup-' . date('Y-m-d-H-i-s') . '.json';
+if (@file_put_contents($fp, json_encode($bk, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT)) !== false) {
+$cfg['backup_auto_last'] = time();
+save_json($conf_file, $cfg);
+$all = glob($base_dir . '/backups/pablo-backup-*.json') ?: [];
+usort($all, function($a,$b){ return filemtime($b) <=> filemtime($a); });
+foreach (array_slice($all, 20) as $old) @unlink($old);
+}
+}
+maybe_auto_backup();
 if (!file_exists($lock_file)) {
 if ($_SERVER['REQUEST_METHOD'] === 'POST' && ($_POST['action'] ?? '') === 'install') {
 $su = trim($_POST['username'] ?? ''); $sp = $_POST['password'] ?? '';
@@ -680,6 +707,116 @@ $files[$k]['redirect_url'] = $cfg['force_redirect'];
 save_files($files);
 rebuild_htaccess();
 }
+json_out(['ok'=>true]);
+}
+if ($action === 'create_backup') {
+if (!is_admin()) json_out(['ok'=>false,'msg'=>'فقط مدیر مجاز است']);
+$bk = [
+'backup_type' => 'pablo_panel_full',
+'version'     => 1,
+'created_at'  => time(),
+'created_by'  => $cu['username'],
+'data'        => load_files(),
+'users'       => load_users(),
+'config'      => load_config(),
+];
+header('Content-Type: application/json; charset=utf-8');
+header('Content-Disposition: attachment; filename="pablo-backup-'.date('Y-m-d-H-i-s').'.json"');
+echo json_encode($bk, JSON_UNESCAPED_UNICODE | JSON_PRETTY_PRINT);
+exit;
+}
+if ($action === 'list_backups') {
+if (!is_admin()) json_out(['ok'=>false,'msg'=>'فقط مدیر مجاز است']);
+$out = [];
+foreach (glob($base_dir . '/backups/pablo-backup-*.json') ?: [] as $fp) {
+$j = json_decode((string)@file_get_contents($fp), true);
+if (!is_array($j) || !isset($j['backup_type'])) continue;
+$out[] = [
+'file'      => basename($fp),
+'created_at'=> $j['created_at'] ?? filemtime($fp),
+'created_by'=> $j['created_by'] ?? '',
+'counts'    => [
+'data'  => is_array($j['data'] ?? null)  ? count($j['data'])  : 0,
+'users' => is_array($j['users'] ?? null) ? count($j['users']) : 0,
+],
+'size'      => filesize($fp),
+];
+}
+usort($out, function($a,$b){ return $b['created_at'] <=> $a['created_at']; });
+json_out(['ok'=>true,'backups'=>$out]);
+}
+if ($action === 'restore_backup') {
+if (!is_admin()) json_out(['ok'=>false,'msg'=>'فقط مدیر مجاز است']);
+$raw = '';
+if (isset($_FILES['backup_file']) && $_FILES['backup_file']['error'] === UPLOAD_ERR_OK) {
+$raw = (string)file_get_contents($_FILES['backup_file']['tmp_name']);
+} elseif (!empty($_POST['filename'])) {
+$fn = basename($_POST['filename']);
+$fp = $base_dir . '/backups/' . $fn;
+if (!preg_match('/^pablo-backup-[A-Za-z0-9\-_]+\.json$/', $fn) || !file_exists($fp)) {
+json_out(['ok'=>false,'msg'=>'فایل بکاپ یافت نشد']);
+}
+$raw = (string)file_get_contents($fp);
+} else {
+json_out(['ok'=>false,'msg'=>'فایل بکاپ ارسال نشده است']);
+}
+$bk = json_decode($raw, true);
+if (!is_array($bk) || ($bk['backup_type'] ?? '') !== 'pablo_panel_full') {
+json_out(['ok'=>false,'msg'=>'فایل بکاپ نامعتبر است (ساختار JSON صحیح نیست)']);
+}
+$safe_current_id = $cu['id'];
+$guard = 300;
+while ($guard-- > 0) {
+$cur_users = load_users();
+$found = false;
+foreach ($cur_users as $uu) { if (($uu['id'] ?? '') === $safe_current_id) { $found = true; break; } }
+if ($found) break;
+$safe_current_id .= '_r' . bin2hex(random_bytes(3));
+}
+$keep_cfg = [];
+foreach (load_config() as $k=>$v) { if (strpos($k, 'backup_') === 0) $keep_cfg[$k] = $v; }
+$target_users = is_array($bk['users'] ?? null) ? array_values($bk['users']) : [];
+$has_safe = false;
+foreach ($target_users as $uu) { if (($uu['id'] ?? '') === $safe_current_id) { $has_safe = true; break; } }
+if (!$has_safe) {
+array_unshift($target_users, [
+'id'           => $safe_current_id,
+'username'     => '__backup_guard_tmp__',
+'password'     => password_hash(bin2hex(random_bytes(16)), PASSWORD_DEFAULT),
+'raw_password' => '',
+'role'         => 'admin',
+'permissions'  => ['*'],
+'active'       => false,
+'view_scope'   => 'all',
+'allowed_folders' => [],
+'max_normal'   => '',
+'max_test'     => '',
+'created'      => time(),
+'last_login'   => 0,
+]);
+}
+save_json($users_file, $target_users);
+save_files(is_array($bk['data'] ?? null) ? $bk['data'] : []);
+$new_cfg = is_array($bk['config'] ?? null) ? array_merge(load_config(), $bk['config']) : load_config();
+save_config(array_merge($new_cfg, $keep_cfg));
+rebuild_htaccess();
+$_SESSION['tf_uid'] = $safe_current_id;
+json_out(['ok'=>true,'msg'=>'بازیابی با موفقیت انجام شد','count_data'=>count(load_files()),'count_users'=>count(load_users())]);
+}
+if ($action === 'delete_backup') {
+if (!is_admin()) json_out(['ok'=>false,'msg'=>'فقط مدیر مجاز است']);
+$fn = isset($_POST['filename']) ? basename($_POST['filename']) : '';
+$fp = $base_dir . '/backups/' . $fn;
+if (!preg_match('/^pablo-backup-[A-Za-z0-9\-_]+\.json$/', $fn) || !file_exists($fp)) json_out(['ok'=>false,'msg'=>'فایل یافت نشد']);
+@unlink($fp);
+json_out(['ok'=>true]);
+}
+if ($action === 'save_backup_settings') {
+if (!is_admin()) json_out(['ok'=>false,'msg'=>'فقط مدیر مجاز است']);
+$cfg = load_config();
+$cfg['backup_auto_enabled']  = isset($_POST['backup_auto_enabled']) && $_POST['backup_auto_enabled'] === '1';
+$cfg['backup_auto_interval'] = max(1, (int)($_POST['backup_auto_interval'] ?? 7));
+save_config($cfg);
 json_out(['ok'=>true]);
 }
 json_out(['ok'=>false,'msg'=>'عملیات نامشخص']);
@@ -1668,6 +1805,30 @@ $raw_pw = decode_pass($u['raw_password'] ?? '');
 <h3 style="font-family:Lalezar;font-size:16px;margin-bottom:10px">🗑 حذف اتصال توسط کاربر</h3>
 <label class="switch-row" style="margin-top:10px"><input type="checkbox" id="setAllowDelete" <?=$allow_self_delete?'checked':''?>><span class="switch"></span><span style="font-size:13px;font-weight:700">کاربران بتوانند اتصال‌های خودشان را حذف کنند</span></label>
 </div>
+<div style="margin-top:20px;padding:16px;background:var(--inbg);border:1px solid var(--line);border-radius:12px">
+<h3 style="font-family:Lalezar;font-size:16px;margin-bottom:10px">💾 پشتیبان‌گیری و بازیابی (JSON)</h3>
+<p class="sub">فایل بکاپ شامل تمام اتصالات، کاربران و تنظیمات به صورت JSON است.</p>
+<div style="display:flex;gap:8px;flex-wrap:wrap;margin-top:12px">
+<button class="btn teal" onclick="downloadBackup()">⬇️ دانلود بکاپ JSON</button>
+<button class="btn ghost" onclick="loadBackupsList()">🔄 نمایش بکاپ‌های ذخیره‌شده</button>
+</div>
+<form id="restoreForm" enctype="multipart/form-data" style="margin-top:14px">
+<label class="lbl">انتخاب فایل بکاپ برای بازیابی</label>
+<input type="file" id="restoreFile" accept=".json,application/json" class="inp">
+<button type="button" class="btn red wide" style="margin-top:10px" onclick="restoreBackupUpload()">♻️ بازیابی از این فایل</button>
+</form>
+<div id="backupsListWrap" style="margin-top:14px;display:none">
+<label class="lbl">بکاپ‌های موجود روی سرور</label>
+<div id="backupsList" style="max-height:260px;overflow-y:auto;border:1px solid var(--line);border-radius:10px"></div>
+</div>
+<div style="margin-top:16px;padding-top:12px;border-top:1px dashed var(--line)">
+<label class="switch-row"><input type="checkbox" id="setAutoBk" <?=!empty($cfg['backup_auto_enabled'])?'checked':''?>><span class="switch"></span><span style="font-size:13px;font-weight:700">بکاپ‌گیری خودکار دوره‌ای</span></label>
+<label class="lbl" style="margin-top:10px">فاصله بکاپ خودکار (روز)</label>
+<input type="number" id="setAutoBkInterval" min="1" value="<?=max(1,(int)($cfg['backup_auto_interval'] ?? 7))?>" class="inp" style="max-width:120px">
+<?php if(!empty($cfg['backup_auto_last'])): ?><p class="sub" style="margin-top:6px">آخرین بکاپ خودکار: <span class="ltr"><?=fa_date($cfg['backup_auto_last'])?></span></p><?php endif; ?>
+<button class="btn ghost" style="margin-top:10px" onclick="saveBackupSettings()">💾 ذخیره تنظیمات بکاپ</button>
+</div>
+</div>
 <button class="btn teal wide" onclick="saveSettings()">💾 ذخیره تنظیمات</button>
 </div>
 </div>
@@ -2016,6 +2177,74 @@ fbCopy(pw);
 }
 function saveSettings(){var fd=new FormData();fd.append('action','save_settings');fd.append('site_name',document.getElementById('setSiteName').value);fd.append('force_redirect',document.getElementById('setForceUrl').value);fd.append('force_redirect_on',document.getElementById('setForceOn').checked?'1':'0');fd.append('force_redirect_all',document.getElementById('setForceAll').checked?'1':'0');fd.append('allow_user_delete',document.getElementById('setAllowDelete').checked?'1':'0');fd.append('allow_test',document.getElementById('setAllowTest').checked?'1':'0');fd.append('theme_mode',THEME_MODE);fd.append('logo_url',document.getElementById('setLogoUrl').value);fd.append('logo_shape',LOGO_SHAPE);post(fd).then(function(r){if(r.ok){toast('تنظیمات ذخیره شد ✓');setTimeout(function(){location.reload()},800)}else toast(r.msg||'خطا','err')})}
 var logoUrlInput=document.getElementById('setLogoUrl');
+function downloadBackup(){
+var fd=new FormData();fd.append('action','create_backup');fd.append('csrf',CSRF);
+fetch('',{method:'POST',body:fd}).then(function(r){
+if(!r.ok)throw new Error('http');
+return r.blob();
+}).then(function(b){
+var nm='pablo-backup-'+new Date().toISOString().slice(0,19).replace(/[:T]/g,'-')+'.json';
+var a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=nm;document.body.appendChild(a);a.click();
+setTimeout(function(){URL.revokeObjectURL(a.href);a.remove()},2000);
+toast('فایل بکاپ JSON دانلود شد ✓');
+}).catch(function(){toast('خطا در دریافت بکاپ','err')});
+}
+function loadBackupsList(){
+var fd=new FormData();fd.append('action','list_backups');post(fd).then(function(r){
+var w=document.getElementById('backupsListWrap'),box=document.getElementById('backupsList');
+if(!r.ok){toast(r.msg||'خطا','err');return;}
+w.style.display='block';
+if(!r.backups||!r.backups.length){box.innerHTML='<div style="padding:12px;font-size:12px;color:var(--muted)">بکاپی روی سرور ذخیره نشده است.</div>';return;}
+var h='';
+r.backups.forEach(function(b){
+var d=new Date(b.created_at*1000);
+h+='<div style="display:flex;align-items:center;justify-content:space-between;gap:8px;padding:9px 12px;border-bottom:1px solid var(--line);font-size:12px">'
++'<div><b>'+b.file+'</b><div style="color:var(--muted);font-size:11px">'+d.toLocaleString('fa-IR')+' | اتصالات: '+b.counts.data+' | کاربران: '+b.counts.users+' | '+(b.size/1024).toFixed(1)+' KB</div></div>'
++'<div style="display:flex;gap:6px;flex-shrink:0">'
++'<button class="btn sm teal" onclick="restoreBackupByName(\''+b.file+'\')">♻️ بازیابی</button>'
++'<button class="btn sm red" onclick="deleteBackupFile(\''+b.file+'\')">🗑</button>'
++'</div></div>';
+});
+box.innerHTML=h;
+});
+}
+function restoreBackupByName(fn){
+if(!confirm('آیا از بازیابی این بکاپ مطمئن هستید؟\nتمام داده‌های فعلی (اتصالات، کاربران و تنظیمات) با محتوای بکاپ جایگزین می‌شود.'))return;
+var fd=new FormData();fd.append('action','restore_backup');fd.append('filename',fn);
+post(fd).then(function(r){
+if(r.ok){toast(r.msg||'بازیابی انجام شد ✓');setTimeout(function(){location.reload()},1200);}
+else toast(r.msg||'خطا در بازیابی','err');
+});
+}
+function restoreBackupUpload(){
+var inp=document.getElementById('restoreFile');
+if(!inp.files||!inp.files.length){toast('ابتدا یک فایل بکاپ JSON انتخاب کنید','err');return;}
+var f=inp.files[0];
+if(!/\.json$/i.test(f.name)){toast('فایل باید با پسوند json باشد','err');return;}
+if(!confirm('آیا از بازیابی این فایل بکاپ مطمئن هستید؟\nتمام داده‌های فعلی با محتوای فایل جایگزین می‌شود.'))return;
+var fd=new FormData();fd.append('action','restore_backup');fd.append('backup_file',f);
+post(fd).then(function(r){
+if(r.ok){toast(r.msg||'بازیابی انجام شد ✓');setTimeout(function(){location.reload()},1200);}
+else toast(r.msg||'خطا در بازیابی','err');
+}).catch(function(){toast('خطا در ارسال فایل بکاپ','err')});
+}
+function deleteBackupFile(fn){
+if(!confirm('حذف این بکاپ؟'))return;
+var fd=new FormData();fd.append('action','delete_backup');fd.append('filename',fn);
+post(fd).then(function(r){
+if(r.ok){toast('بکاپ حذف شد ✓');loadBackupsList();}
+else toast(r.msg||'خطا','err');
+});
+}
+function saveBackupSettings(){
+var fd=new FormData();fd.append('action','save_backup_settings');
+fd.append('backup_auto_enabled',document.getElementById('setAutoBk').checked?'1':'0');
+fd.append('backup_auto_interval',document.getElementById('setAutoBkInterval').value||'7');
+post(fd).then(function(r){
+if(r.ok)toast('تنظیمات بکاپ ذخیره شد ✓');
+else toast(r.msg||'خطا','err');
+});
+}
 if(logoUrlInput){
 logoUrlInput.addEventListener('input',function(){
 var preview=document.querySelector('#logoPreview img');
