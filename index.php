@@ -62,6 +62,7 @@ $self = basename($_SERVER['SCRIPT_NAME'] ?: 'index.php');
 $rules = [];
 foreach ($files as $f) {
 if ($f['expires'] < $now) continue;
+if (!empty($f['disabled'])) continue; // اتصالات غیرفعال در htaccess نوشته نمی‌شوند
 if (!empty($f['is_redirect']) && !empty($f['redirect_url'])) {
 $rel = ($f['folder'] !== '' ? $f['folder'] . '/' : '') . $f['filename'];
 $url = trim(str_replace(["\r","\n","\t"," "], '', $f['redirect_url']));
@@ -152,6 +153,10 @@ $force_applies = !$admin_owner;
 if ($force_applies) { $target = $cfg['force_redirect']; }
 elseif (!empty($matched['is_redirect']) && !empty($matched['redirect_url'])) { $target = $matched['redirect_url']; }
 if ($target !== '') { header('Location: ' . $target, true, 302); exit; }
+// اتصال غیرفعال (فریز دستی) — تا فعال‌سازی مجدد سرویس نمی‌شود
+if (!empty($matched['disabled'])) {
+notice_page('🧊', 'اتصال غیرفعال است', 'این اتصال توسط مدیر غیرفعال شده و موقتاً از سرویس خارج است. پس از فعال‌سازی مجدد، همان لینک دوباره کار خواهد کرد.', 403);
+}
 if (file_exists($matched['path'])) {
 header('Content-Type: text/plain; charset=utf-8');
 header('Content-Length: ' . filesize($matched['path']));
@@ -428,6 +433,49 @@ $exp = $cu['agent_expires'] ?? 0;
 if ($exp > 0 && $exp < time()) $agent_frozen = true;
 }
 if ($action === 'cleanup') { cleanup_expired(); json_out(['ok'=>true]); }
+// ─── تمدید اتصال (از زمان پایان فعلی) ───
+if ($action === 'extend_connection') {
+if ($agent_frozen) json_out(['ok'=>false,'msg'=>'حساب شما منقضی شده و امکان تمدید اتصال ندارید.']);
+$files = load_files(); $found = false;
+foreach ($files as $k => $f) {
+if ($f['id'] === ($_POST['file_id'] ?? '')) {
+if (!is_admin() && ($f['owner'] ?? '') !== $cu['username']) json_out(['ok'=>false,'msg'=>'دسترسی ندارید']);
+if (!is_admin() && !has_perm('edit_file')) json_out(['ok'=>false,'msg'=>'دسترسی ندارید']);
+$sec = max(0,(int)($_POST['m']??0))*2592000 + max(0,(int)($_POST['d']??0))*86400 + max(0,(int)($_POST['h']??0))*3600;
+if ($sec <= 0) json_out(['ok'=>false,'msg'=>'مقدار تمدید نامعتبر است']);
+if (!empty($f['is_test'])) json_out(['ok'=>false,'msg'=>'اتصال تستی قابلیت تمدید ندارد (اعتبار ثابت ۴ ساعت)']);
+$base = max(time(), (int)$f['expires']); // تمدید از انتهای اعتبار فعلی
+$files[$k]['expires'] = $base + $sec;
+$found = true;
+break;
+}
+}
+if (!$found) json_out(['ok'=>false,'msg'=>'اتصال یافت نشد']);
+save_files($files); rebuild_htaccess();
+json_out(['ok'=>true,'msg'=>'تمدید شد ✓','expires'=>$files[$k]['expires']]);
+}
+// ─── غیرفعال / فعال کردن اتصال (فریز دستی) ───
+if ($action === 'toggle_conn') {
+if ($agent_frozen) json_out(['ok'=>false,'msg'=>'حساب شما منقضی شده و امکان تغییر وضعیت اتصال ندارید.']);
+$to_disable = isset($_POST['disable']) && $_POST['disable'] === '1';
+if ($to_disable) {
+if (!is_admin() && !has_perm('delete_file')) json_out(['ok'=>false,'msg'=>'برای غیرفعال کردن اتصال نیاز به دسترسی حذف دارید']);
+} else {
+if (!is_admin() && !has_perm('create_file')) json_out(['ok'=>false,'msg'=>'برای فعال کردن اتصال نیاز به دسترسی ساخت دارید']);
+}
+$files = load_files(); $found = false;
+foreach ($files as $k => $f) {
+if ($f['id'] === ($_POST['file_id'] ?? '')) {
+if (!is_admin() && ($f['owner'] ?? '') !== $cu['username']) json_out(['ok'=>false,'msg'=>'دسترسی ندارید']);
+$files[$k]['disabled'] = $to_disable;
+$found = true;
+break;
+}
+}
+if (!$found) json_out(['ok'=>false,'msg'=>'اتصال یافت نشد']);
+save_files($files); rebuild_htaccess();
+json_out(['ok'=>true,'disabled'=>$to_disable]);
+}
 if ($action === 'create') {
 if ($agent_frozen) json_out(['ok'=>false,'msg'=>'حساب شما منقضی شده و امکان ساخت اتصال ندارید.']);
 $cfg = load_config();
@@ -476,6 +524,7 @@ $new = [
 'path'=>$dir.'/'.$filename,'created'=>time(),'expires'=>time()+$sec,
 'owner'=>$cu['username'],'is_redirect'=>$is_redirect,
 'redirect_url'=>$is_redirect ? $redirect_url : '','is_test'=>$is_test,
+'disabled'=>false,
 ];
 $files[] = $new; save_files($files); rebuild_htaccess();
 json_out(['ok'=>true,'url'=>file_url($new)]);
@@ -1228,6 +1277,8 @@ input[type=url]{direction:ltr;text-align:left}
 .card.expired-card{opacity:.55;filter:grayscale(.45);border-inline-start-color:var(--line2)}
 .card.expired-card:hover{opacity:.8}
 .card.frozen-card{opacity:.6;filter:grayscale(.6);border-inline-start-color:var(--agent)}
+.card.disabled-conn{opacity:.72;filter:grayscale(.35);border-inline-start-color:var(--red)}
+.chip.disabled-chip{background:rgba(239,68,68,.12);border-color:rgba(239,68,68,.35);color:var(--red)}
 .card-top{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .fname{font-family:Lalezar;font-size:18px;font-weight:400;word-break:break-all;line-height:1.3}
 .dot{width:10px;height:10px;min-width:10px;border-radius:50%;background:var(--teal);animation:pulse 2s infinite}
@@ -1622,15 +1673,16 @@ $is_exp=$f['expires']<$now;$rem=max(0,$f['expires']-$now);$total=max(1,$f['expir
 $cls=$is_exp?'':($rem<3600?'low':($pct<50?'mid':''));$size=(!$is_exp && file_exists($f['path']))?filesize($f['path']):0;$furl=file_url($f);
 $can_modify=is_admin()||($f['owner']??'')===$cu['username'];$show_del=$can_modify&&(is_admin()||($allow_self_delete&&has_perm('delete_file')));
 $is_frozen = ($cu['role']==='agent' && $agent_frozen);
+$is_dis = !empty($f['disabled']); $can_toggle = $can_modify && !$is_frozen;
 ?>
-<article class="card reveal <?=$cls?><?=$is_exp?' expired-card':''?><?=$is_frozen?' frozen-card':''?>" data-id="<?=$f['id']?>" data-folder="<?=htmlspecialchars($f['folder'])?>" data-expires="<?=$f['expires']?>" data-created="<?=$f['created']?>" data-total="<?=$total?>" data-url="<?=htmlspecialchars($furl)?>" <?=$is_exp?'data-expired="1"':''?> style="animation-delay:<?=$i*70?>ms">
+<article class="card reveal <?=$cls?><?=$is_exp?' expired-card':''?><?=$is_frozen?' frozen-card':''?><?=$is_dis?' disabled-conn':''?>" data-id="<?=$f['id']?>" data-folder="<?=htmlspecialchars($f['folder'])?>" data-expires="<?=$f['expires']?>" data-created="<?=$f['created']?>" data-total="<?=$total?>" data-url="<?=htmlspecialchars($furl)?>" <?=$is_exp?'data-expired="1"':''?><?=$is_dis?' data-disabled="1"':''?> style="animation-delay:<?=$i*70?>ms">
 <div class="card-top"><h3 class="fname"><?=htmlspecialchars($f['filename'])?></h3><span class="dot"></span></div>
-<div class="fmeta"><span class="chip">📁 <?=htmlspecialchars($f['folder']===''?'ریشه':$f['folder'])?></span><?php if($is_exp): ?><span class="chip exp-chip">⏳ منقضی شده</span><?php elseif($is_frozen): ?><span class="chip frozen-chip">🧊 فریز شده</span><?php else: ?><span class="chip"><?=fa_num($size)?> بایت</span><?php endif; ?><?php if($IS_ADMIN && !empty($f['owner'])): ?><span class="chip owner-chip">👤 <?=htmlspecialchars($f['owner'])?></span><?php endif; ?></div>
+<div class="fmeta"><span class="chip">📁 <?=htmlspecialchars($f['folder']===''?'ریشه':$f['folder'])?></span><?php if($is_dis): ?><span class="chip disabled-chip">🧊 غیرفعال</span><?php endif; ?><?php if($is_exp): ?><span class="chip exp-chip">⏳ منقضی شده</span><?php elseif($is_frozen): ?><span class="chip frozen-chip">🧊 فریز شده</span><?php else: ?><span class="chip"><?=fa_num($size)?> بایت</span><?php endif; ?><?php if($IS_ADMIN && !empty($f['owner'])): ?><span class="chip owner-chip">👤 <?=htmlspecialchars($f['owner'])?></span><?php endif; ?></div>
 <div class="url-box"><input type="text" value="<?=htmlspecialchars($furl)?>" readonly onclick="this.select()"><button onclick="copyUrl('<?=$f['id']?>')">📋</button><button onclick="openQr('<?=$f['id']?>')"><?=$qr_svg?></button><a href="<?=htmlspecialchars($furl)?>" target="_blank">🔗</a></div>
-<div class="cd-wrap"><span class="cd-label">زمان باقی‌مانده</span><div class="cd"><?=$is_exp?'⏳ منقضی شده':($is_frozen?'🧊 فریز شده':'')?></div></div>
+<div class="cd-wrap"><span class="cd-label">زمان باقی‌مانده</span><div class="cd"><?=$is_exp?'⏳ منقضی شده':($is_frozen?'🧊 فریز شده':($is_dis?'🧊 غیرفعال — سرویس نمی‌شود':''))?></div></div>
 <div class="bar"><i style="width:<?=$is_exp?0:$pct?>%"></i></div>
 <div class="dates"><span>ساخت: <span class="ltr"><?=fa_date($f['created'])?></span></span><span>پایان: <span class="ltr"><?=fa_date($f['expires'])?></span></span></div>
-<div class="acts"><?php if(has_perm('edit_file')&&$can_modify&&!$agent_frozen): ?><button class="btn sm ghost" onclick="openEdit('<?=$f['id']?>')">✏️ ویرایش</button><?php endif; ?><button class="btn sm ghost" onclick="copyUrl('<?=$f['id']?>')">📋 کپی لینک</button><button class="btn sm ghost" onclick="openQr('<?=$f['id']?>')">▦ بارکد</button><?php if($show_del&&!$agent_frozen): ?><button class="btn sm red" onclick="delFile('<?=$f['id']?>')">🗑 حذف</button><?php endif; ?></div>
+<div class="acts"><?php if(has_perm('edit_file')&&$can_modify&&!$agent_frozen): ?><button class="btn sm ghost" onclick="openEdit('<?=$f['id']?>')">✏️ ویرایش</button><?php endif; ?><?php if($can_toggle): ?><button class="btn sm <?=($is_dis?'green':'red')?>" onclick="toggleConn('<?=$f['id']?>',<?=($is_dis?'false':'true')?>)" title="<?=($is_dis?'فعال‌سازی مجدد اتصال':'موقتاً از سرویس خارج کن (فریز)')?>"><?=($is_dis?'🔓 فعال کردن':'🧊 غیرفعال')?></button><?php endif; ?><button class="btn sm ghost" onclick="extendConnection('<?=$f['id']?>','<?=htmlspecialchars(fa_date($f['expires']))?>')">⏰ تمدید</button><button class="btn sm ghost" onclick="copyUrl('<?=$f['id']?>')">📋 کپی لینک</button><button class="btn sm ghost" onclick="openQr('<?=$f['id']?>')">▦ بارکد</button><?php if($show_del&&!$agent_frozen): ?><button class="btn sm red" onclick="delFile('<?=$f['id']?>')">🗑 حذف</button><?php endif; ?></div>
 </article>
 <?php endforeach; ?>
 <div class="empty" id="emptyText" style="<?=!empty($text_files)?'display:none':''?>"><div class="empty-ic">🔗</div><h3>لینک اتصال</h3></div>
@@ -1642,15 +1694,16 @@ $is_exp=$f['expires']<$now;$rem=max(0,$f['expires']-$now);$total=max(1,$f['expir
 $cls=$is_exp?'':($rem<3600?'low':($pct<50?'mid':''));$furl=file_url($f);$rurl=$f['redirect_url']??'';
 $can_modify=is_admin()||($f['owner']??'')===$cu['username'];$show_del=$can_modify&&(is_admin()||($allow_self_delete&&has_perm('delete_file')));
 $is_frozen = ($cu['role']==='agent' && $agent_frozen);
+$is_dis = !empty($f['disabled']); $can_toggle = $can_modify && !$is_frozen;
 ?>
-<article class="card reveal <?=$cls?><?=$is_exp?' expired-card':''?><?=$is_frozen?' frozen-card':''?>" data-id="<?=$f['id']?>" data-folder="<?=htmlspecialchars($f['folder'])?>" data-expires="<?=$f['expires']?>" data-created="<?=$f['created']?>" data-total="<?=$total?>" data-url="<?=htmlspecialchars($furl)?>" <?=$is_exp?'data-expired="1"':''?> style="animation-delay:<?=$i*70?>ms">
+<article class="card reveal <?=$cls?><?=$is_exp?' expired-card':''?><?=$is_frozen?' frozen-card':''?><?=$is_dis?' disabled-conn':''?>" data-id="<?=$f['id']?>" data-folder="<?=htmlspecialchars($f['folder'])?>" data-expires="<?=$f['expires']?>" data-created="<?=$f['created']?>" data-total="<?=$total?>" data-url="<?=htmlspecialchars($furl)?>" <?=$is_exp?'data-expired="1"':''?><?=$is_dis?' data-disabled="1"':''?> style="animation-delay:<?=$i*70?>ms">
 <div class="card-top"><h3 class="fname"><?=htmlspecialchars($f['filename'])?></h3><span class="dot"></span></div>
-<div class="fmeta"><span class="chip">📁 <?=htmlspecialchars($f['folder']===''?'ریشه':$f['folder'])?></span><span class="chip">🔗 ریدایرکت</span><?php if($is_exp): ?><span class="chip exp-chip">⏳ منقضی شده</span><?php elseif($is_frozen): ?><span class="chip frozen-chip">🧊 فریز شده</span><?php endif; ?><?php if(!$hide_redirect_info&&$rurl): ?><span class="chip" style="direction:ltr;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?=htmlspecialchars($rurl)?></span><?php endif; ?><?php if($IS_ADMIN && !empty($f['owner'])): ?><span class="chip owner-chip">👤 <?=htmlspecialchars($f['owner'])?></span><?php endif; ?></div>
+<div class="fmeta"><span class="chip">📁 <?=htmlspecialchars($f['folder']===''?'ریشه':$f['folder'])?></span><span class="chip">🔗 ریدایرکت</span><?php if($is_dis): ?><span class="chip disabled-chip">🧊 غیرفعال</span><?php endif; ?><?php if($is_exp): ?><span class="chip exp-chip">⏳ منقضی شده</span><?php elseif($is_frozen): ?><span class="chip frozen-chip">🧊 فریز شده</span><?php endif; ?><?php if(!$hide_redirect_info&&$rurl): ?><span class="chip" style="direction:ltr;max-width:180px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap"><?=htmlspecialchars($rurl)?></span><?php endif; ?><?php if($IS_ADMIN && !empty($f['owner'])): ?><span class="chip owner-chip">👤 <?=htmlspecialchars($f['owner'])?></span><?php endif; ?></div>
 <div class="url-box"><input type="text" value="<?=htmlspecialchars($furl)?>" readonly onclick="this.select()"><button onclick="copyUrl('<?=$f['id']?>')">📋</button><button onclick="openQr('<?=$f['id']?>')"><?=$qr_svg?></button><a href="<?=htmlspecialchars($furl)?>" target="_blank">🔗</a></div>
-<div class="cd-wrap"><span class="cd-label">زمان باقی‌مانده</span><div class="cd"><?=$is_exp?'⏳ منقضی شده':($is_frozen?'🧊 فریز شده':'')?></div></div>
+<div class="cd-wrap"><span class="cd-label">زمان باقی‌مانده</span><div class="cd"><?=$is_exp?'⏳ منقضی شده':($is_frozen?'🧊 فریز شده':($is_dis?'🧊 غیرفعال — سرویس نمی‌شود':''))?></div></div>
 <div class="bar"><i style="width:<?=$is_exp?0:$pct?>%"></i></div>
 <div class="dates"><span>ساخت: <span class="ltr"><?=fa_date($f['created'])?></span></span><span>پایان: <span class="ltr"><?=fa_date($f['expires'])?></span></span></div>
-<div class="acts"><?php if(has_perm('edit_file')&&$can_modify&&!$agent_frozen): ?><button class="btn sm ghost" onclick="openEdit('<?=$f['id']?>')">✏️ ویرایش</button><?php endif; ?><button class="btn sm ghost" onclick="copyUrl('<?=$f['id']?>')">📋 کپی لینک</button><button class="btn sm ghost" onclick="openQr('<?=$f['id']?>')">▦ بارکد</button><?php if($show_del&&!$agent_frozen): ?><button class="btn sm red" onclick="delFile('<?=$f['id']?>')">🗑 حذف</button><?php endif; ?></div>
+<div class="acts"><?php if(has_perm('edit_file')&&$can_modify&&!$agent_frozen): ?><button class="btn sm ghost" onclick="openEdit('<?=$f['id']?>')">✏️ ویرایش</button><?php endif; ?><?php if($can_toggle): ?><button class="btn sm <?=($is_dis?'green':'red')?>" onclick="toggleConn('<?=$f['id']?>',<?=($is_dis?'false':'true')?>)" title="<?=($is_dis?'فعال‌سازی مجدد اتصال':'موقتاً از سرویس خارج کن (فریز)')?>"><?=($is_dis?'🔓 فعال کردن':'🧊 غیرفعال')?></button><?php endif; ?><button class="btn sm ghost" onclick="extendConnection('<?=$f['id']?>','<?=htmlspecialchars(fa_date($f['expires']))?>')">⏰ تمدید</button><button class="btn sm ghost" onclick="copyUrl('<?=$f['id']?>')">📋 کپی لینک</button><button class="btn sm ghost" onclick="openQr('<?=$f['id']?>')">▦ بارکد</button><?php if($show_del&&!$agent_frozen): ?><button class="btn sm red" onclick="delFile('<?=$f['id']?>')">🗑 حذف</button><?php endif; ?></div>
 </article>
 <?php endforeach; ?>
 <div class="empty" id="emptyRedirect" style="<?=!empty($redirect_files)?'display:none':''?>"><div class="empty-ic">🔗</div><h3>اتصالی وجود ندارد</h3></div>
@@ -1662,15 +1715,16 @@ $is_exp=$f['expires']<$now;$rem=max(0,$f['expires']-$now);$total=max(1,$f['expir
 $cls=$is_exp?'':($rem<3600?'low':'');$furl=file_url($f);
 $can_modify=is_admin()||($f['owner']??'')===$cu['username'];$show_del=$can_modify&&(is_admin()||($allow_self_delete&&has_perm('delete_file')));
 $is_frozen = ($cu['role']==='agent' && $agent_frozen);
+$is_dis = !empty($f['disabled']); $can_toggle = $can_modify && !$is_frozen;
 ?>
-<article class="card reveal test-card <?=$cls?><?=$is_exp?' expired-card':''?><?=$is_frozen?' frozen-card':''?>" data-id="<?=$f['id']?>" data-folder="<?=htmlspecialchars($f['folder'])?>" data-expires="<?=$f['expires']?>" data-created="<?=$f['created']?>" data-total="<?=$total?>" data-url="<?=htmlspecialchars($furl)?>" <?=$is_exp?'data-expired="1"':''?> style="animation-delay:<?=$i*70?>ms">
+<article class="card reveal test-card <?=$cls?><?=$is_exp?' expired-card':''?><?=$is_frozen?' frozen-card':''?><?=$is_dis?' disabled-conn':''?>" data-id="<?=$f['id']?>" data-folder="<?=htmlspecialchars($f['folder'])?>" data-expires="<?=$f['expires']?>" data-created="<?=$f['created']?>" data-total="<?=$total?>" data-url="<?=htmlspecialchars($furl)?>" <?=$is_exp?'data-expired="1"':''?><?=$is_dis?' data-disabled="1"':''?> style="animation-delay:<?=$i*70?>ms">
 <div class="card-top"><h3 class="fname"><?=htmlspecialchars($f['filename'])?></h3><span class="dot"></span></div>
-<div class="fmeta"><span class="chip">📁 <?=htmlspecialchars($f['folder']===''?'ریشه':$f['folder'])?></span><span class="chip test-chip">🧪 تستی — ۴ ساعته</span><?php if($is_exp): ?><span class="chip exp-chip">⏳ منقضی شده</span><?php elseif($is_frozen): ?><span class="chip frozen-chip">🧊 فریز شده</span><?php endif; ?><?php if($IS_ADMIN && !empty($f['owner'])): ?><span class="chip owner-chip">👤 <?=htmlspecialchars($f['owner'])?></span><?php endif; ?></div>
+<div class="fmeta"><span class="chip">📁 <?=htmlspecialchars($f['folder']===''?'ریشه':$f['folder'])?></span><span class="chip test-chip">🧪 تستی — ۴ ساعته</span><?php if($is_dis): ?><span class="chip disabled-chip">🧊 غیرفعال</span><?php endif; ?><?php if($is_exp): ?><span class="chip exp-chip">⏳ منقضی شده</span><?php elseif($is_frozen): ?><span class="chip frozen-chip">🧊 فریز شده</span><?php endif; ?><?php if($IS_ADMIN && !empty($f['owner'])): ?><span class="chip owner-chip">👤 <?=htmlspecialchars($f['owner'])?></span><?php endif; ?></div>
 <div class="url-box"><input type="text" value="<?=htmlspecialchars($furl)?>" readonly onclick="this.select()"><button onclick="copyUrl('<?=$f['id']?>')">📋</button><button onclick="openQr('<?=$f['id']?>')"><?=$qr_svg?></button><a href="<?=htmlspecialchars($furl)?>" target="_blank">🔗</a></div>
-<div class="cd-wrap"><span class="cd-label">زمان باقی‌مانده</span><div class="cd"><?=$is_exp?'⏳ منقضی شده':($is_frozen?'🧊 فریز شده':'')?></div></div>
+<div class="cd-wrap"><span class="cd-label">زمان باقی‌مانده</span><div class="cd"><?=$is_exp?'⏳ منقضی شده':($is_frozen?'🧊 فریز شده':($is_dis?'🧊 غیرفعال — سرویس نمی‌شود':''))?></div></div>
 <div class="bar"><i style="width:<?=$is_exp?0:$pct?>%"></i></div>
 <div class="dates"><span>ساخت: <span class="ltr"><?=fa_date($f['created'])?></span></span><span>پایان: <span class="ltr"><?=fa_date($f['expires'])?></span></span></div>
-<div class="acts"><button class="btn sm ghost" onclick="copyUrl('<?=$f['id']?>')">📋 کپی لینک</button><button class="btn sm ghost" onclick="openQr('<?=$f['id']?>')">▦ بارکد</button><?php if($show_del&&!$agent_frozen): ?><button class="btn sm red" onclick="delFile('<?=$f['id']?>')">🗑 حذف</button><?php endif; ?></div>
+<div class="acts"><?php if($can_toggle): ?><button class="btn sm <?=($is_dis?'green':'red')?>" onclick="toggleConn('<?=$f['id']?>',<?=($is_dis?'false':'true')?>)" title="<?=($is_dis?'فعال‌سازی مجدد اتصال':'موقتاً از سرویس خارج کن (فریز)')?>"><?=($is_dis?'🔓 فعال کردن':'🧊 غیرفعال')?></button><?php endif; ?><button class="btn sm ghost" onclick="copyUrl('<?=$f['id']?>')">📋 کپی لینک</button><button class="btn sm ghost" onclick="openQr('<?=$f['id']?>')">▦ بارکد</button><?php if($show_del&&!$agent_frozen): ?><button class="btn sm red" onclick="delFile('<?=$f['id']?>')">🗑 حذف</button><?php endif; ?></div>
 </article>
 <?php endforeach; ?>
 <div class="empty" id="emptyTest" style="<?=!empty($test_files)?'display:none':''?>"><div class="empty-ic">🧪</div><h3>اتصال تستی وجود ندارد</h3></div>
@@ -2003,7 +2057,7 @@ function toggleTestMode(){var chk=document.getElementById('isTestChk');if(!chk)r
 function checkEmpty(){var et=document.getElementById('emptyText');var er=document.getElementById('emptyRedirect');var etst=document.getElementById('emptyTest');if(et)et.style.display=document.querySelectorAll('#tab-text .card[data-expires]').length?'none':'block';if(er)er.style.display=document.querySelectorAll('#tab-redirect .card[data-expires]').length?'none':'block';if(etst)etst.style.display=document.querySelectorAll('#tab-test .card[data-expires]').length?'none':'block'}
 function updateStats(){var cs=document.querySelectorAll('.card[data-expires]');var active=0;cs.forEach(function(c){if(c.dataset.expired!=='1')active++});document.getElementById('sCount').textContent=faNum(active)}
 function updateNext(){var now=Math.floor(Date.now()/1000),min=Infinity;document.querySelectorAll('.card[data-expires]').forEach(function(c){var r=+c.dataset.expires-now;if(r>0&&r<min)min=r});var el=document.getElementById('nextExp');if(min===Infinity){el.textContent='—';return}var d=Math.floor(min/86400),h=Math.floor(min%86400/3600),m=Math.floor(min%3600/60);el.innerHTML=(d>0?'<span class="n">'+faNum(d)+'</span> روز ':'')+'<span class="n">'+faNum(pad(h)+':'+pad(m))+'</span>'}
-function tickCards(){var now=Math.floor(Date.now()/1000);var changed=false;document.querySelectorAll('.card[data-expires]').forEach(function(c){var rem=+c.dataset.expires-now;if(rem<=0){if(c.dataset.expired!=='1'){c.dataset.expired='1';c.classList.add('expired-card');c.classList.remove('low','mid');c.querySelector('.cd').innerHTML='⏳ منقضی شده';c.querySelector('.bar i').style.width='0%';changed=true}return}var d=Math.floor(rem/86400),h=Math.floor(rem%86400/3600),m=Math.floor(rem%3600/60),s=rem%60;c.querySelector('.cd').innerHTML=(d>0?'<span class="n">'+faNum(d)+'</span> روز ':'')+'<span class="n">'+faNum(pad(h)+':'+pad(m)+':'+pad(s))+'</span>';var pct=Math.max(0,Math.min(100,rem/+c.dataset.total*100));c.querySelector('.bar i').style.width=pct+'%';c.classList.toggle('low',rem<3600);if(!c.classList.contains('test-card'))c.classList.toggle('mid',rem>=3600&&pct<50)});if(changed)updateStats();updateNext()}
+function tickCards(){var now=Math.floor(Date.now()/1000);var changed=false;document.querySelectorAll('.card[data-expires]').forEach(function(c){var rem=+c.dataset.expires-now;if(rem<=0){if(c.dataset.expired!=='1'){c.dataset.expired='1';c.classList.add('expired-card');c.classList.remove('low','mid');c.querySelector('.cd').innerHTML=c.dataset.disabled==='1'?'🧊 غیرفعال — سرویس نمی‌شود':'⏳ منقضی شده';c.querySelector('.bar i').style.width='0%';changed=true}return}var d=Math.floor(rem/86400),h=Math.floor(rem%86400/3600),m=Math.floor(rem%3600/60),s=rem%60;c.querySelector('.cd').innerHTML=(c.dataset.disabled==='1')?'🧊 غیرفعال — سرویس نمی‌شود':((d>0?'<span class="n">'+faNum(d)+'</span> روز ':'')+'<span class="n">'+faNum(pad(h)+':'+pad(m)+':'+pad(s))+'</span>');var pct=Math.max(0,Math.min(100,rem/+c.dataset.total*100));c.querySelector('.bar i').style.width=pct+'%';c.classList.toggle('low',rem<3600);if(!c.classList.contains('test-card'))c.classList.toggle('mid',rem>=3600&&pct<50)});if(changed)updateStats();updateNext()}
 function copyUrl(id){var c=document.querySelector('.card[data-id="'+id+'"]');if(!c)return;var url=c.dataset.url;if(!url)return;if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(url).then(function(){toast('لینک کپی شد ✓')}).catch(function(){fbCopy(url)})}else fbCopy(url)}
 function fbCopy(t){var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.focus();a.select();try{document.execCommand('copy');toast('لینک کپی شد ✓')}catch(e){toast('کپی ناموفق بود','err')}a.remove()}
 function openQr(id){var c=document.querySelector('.card[data-id="'+id+'"]');if(!c)return;var url=c.dataset.url;if(!url)return;document.getElementById('qrName').textContent=c.querySelector('.fname').textContent;var src='https://api.qrserver.com/v1/create-qr-code/?size=260x260&data='+encodeURIComponent(url);document.getElementById('qrImg').src=src;document.getElementById('qrUrl').value=url;document.getElementById('qrDownload').href=src;document.getElementById('qrOverlay').classList.add('on')}
@@ -2020,6 +2074,51 @@ function closeEdit(){document.getElementById('overlay').classList.remove('on');e
 function saveEdit(){if(!editId)return;var fd=new FormData();fd.append('action','update');fd.append('file_id',editId);fd.append('content',document.getElementById('eContent').value);fd.append('redirect_url',document.getElementById('eRedirect').value);fd.append('m',document.getElementById('eM').value||0);fd.append('d',document.getElementById('eD').value||0);fd.append('h',document.getElementById('eH').value||0);post(fd).then(function(r){if(r.ok){toast('ذخیره شد ✓');smoothReload()}else toast(r.msg||'خطا','err')})}
 document.getElementById('overlay').addEventListener('click',function(e){if(e.target===this)closeEdit()});
 function delFile(id){if(!confirm('این اتصال حذف شود؟'))return;var fd=new FormData();fd.append('action','delete');fd.append('file_id',id);post(fd).then(function(r){if(r.ok){var c=document.querySelector('.card[data-id="'+id+'"]');if(c){c.style.transition='opacity .35s,transform .35s';c.style.opacity='0';c.style.transform='scale(.92)';setTimeout(function(){c.remove()},360)}toast('حذف شد');updateStats();checkEmpty()}else toast(r.msg||'خطا','err')})}
+// ─── غیرفعال / فعال کردن اتصال ───
+function toggleConn(id,toDisable){
+var c=document.querySelector('.card[data-id="'+id+'"]');
+var nm=c?c.querySelector('.fname').textContent:'';
+if(toDisable){if(!confirm('اتصال «'+nm+'» موقتاً غیرفعال (فریز) شود؟\nلینک تا فعال‌سازی مجدد سرویس نمی‌شود ولی حذف نمی‌گردد.'))return;}
+var fd=new FormData();
+fd.append('action','toggle_conn');
+fd.append('file_id',id);
+fd.append('disable',toDisable?'1':'0');
+post(fd).then(function(r){
+if(r.ok){toast(toDisable?'🧊 اتصال غیرفعال شد ✓':'🔓 اتصال فعال شد ✓');smoothReload()}
+else toast(r.msg||'خطا','err');
+});
+}
+// ─── تمدید اتصال ───
+function extendConnection(id,expText){
+var c=document.querySelector('.card[data-id="'+id+'"]');
+if(!c)return;
+if(c.classList.contains('test-card')){toast('اتصال تستی قابلیت تمدید ندارد (اعتبار ثابت ۴ ساعت)','err');return;}
+var nm=c.querySelector('.fname').textContent;
+var v=prompt('تمدید اتصال «'+nm+'»\n\nپایان فعلی: '+expText+'\n\nچقدر به پایان اعتبار فعلی اضافه شود؟\nنمونه: 1month  or  2day 12hour  or  45m 2d 3h\n(m=ماه، d=روز، h=ساعت)','1 month');
+if(v===null)return;
+v=String(v).trim().toLowerCase();
+if(!v){toast('مقداری وارد نشده است','err');return;}
+var m=(v.match(/(\d+)\s*(m|month|months|ماه)/)||[])[1];
+var d=(v.match(/(\d+)\s*(d|day|days|روز)/)||[])[1];
+var h=(v.match(/(\d+)\s*(h|hour|hours|ساعت)/)||[])[1];
+m=parseInt(m||0,10)||0;d=parseInt(d||0,10)||0;h=parseInt(h||0,10)||0;
+if(m<=0&&d<=0&&h<=0){toast('قالب وارد شده نامعتبر است','err');return;}
+var totalSec=m*2592000+d*86400+h*3600;
+var base=Math.max(Math.floor(Date.now()/1000),+c.dataset.expires||0);
+var nd=Math.floor(totalSec/86400),nh=Math.floor(totalSec%86400/3600),nmin=Math.floor(totalSec%3600/60);
+var newExp=new Date((base+totalSec)*1000);
+var nj=toJalali(newExp.getFullYear(),newExp.getMonth()+1,newExp.getDate());
+var confirmTxt='این اتصال به مدت '+(nd>0?(faNum(nd)+' روز '):'')+faNum(pad(nh))+':'+faNum(pad(nmin))+' تمدید شود؟\n\nپایان جدید: '+faNum(nj[0])+'/'+faNum(pad(nj[1]))+'/'+faNum(pad(nj[2]))+' '+faNum(pad(newExp.getHours())+':'+pad(newExp.getMinutes()));
+if(!confirm(confirmTxt))return;
+var fd=new FormData();
+fd.append('action','extend_connection');
+fd.append('file_id',id);
+fd.append('m',m);fd.append('d',d);fd.append('h',h);
+post(fd).then(function(r){
+if(r.ok){toast('⏰ اتصال تمدید شد ✓');smoothReload()}
+else toast(r.msg||'خطا','err');
+});
+}
 function copyText(t){if(navigator.clipboard&&navigator.clipboard.writeText){navigator.clipboard.writeText(t).then(function(){toast('کپی شد ✓')}).catch(function(){fbCopy2(t)})}else fbCopy2(t)}
 function fbCopy2(t){var a=document.createElement('textarea');a.value=t;a.style.position='fixed';a.style.opacity='0';document.body.appendChild(a);a.focus();a.select();try{document.execCommand('copy');toast('کپی شد ✓')}catch(e){toast('کپی ناموفق بود','err')}a.remove()}
 function pasteInto(ta){if(!ta)return;if(navigator.clipboard&&navigator.clipboard.readText){navigator.clipboard.readText().then(function(t){ta.value=t;toast('چسبانده شد ✓')}).catch(function(){ta.focus();toast('از Ctrl+V استفاده کنید','err')})}else{ta.focus();toast('مرورگر از Clipboard API پشتیبانی نمی‌کند','err')}}
